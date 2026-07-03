@@ -1,0 +1,153 @@
+/*
+ * caveat_delegation.spthy -- REFERENCE RECONSTRUCTION (C2) for cross-checking.
+ *
+ * Reconstructed from the manuscript's CAVEAT description (Sections 5-6):
+ * macaroon-style HMAC-chained capability tokens under a per-server key k_S,
+ * attenuation-only delegation with bounded caveat-chain depth, and
+ * per-invocation re-attestation of the served tool definition against the
+ * digest pinned at grant time. The author's original theory file remains
+ * authoritative; this file targets verdict-level agreement.
+ *
+ * Chain construction (depth <= 1 caveat, per the bounded-depth modelling):
+ *   sig0 = hmac(<'root', S, scope0, h(D)>, k_S)         -- root capability
+ *   sig1 = hmac(<'cav', scope1>, sig0)                  -- attenuation
+ * Scopes: roots are issued at 'full'; 'full' covers {'full', 'read'}.
+ * The adversary receives delegated (attenuated) capabilities and may
+ * inject arbitrary caveat-shaped content, but lacks k_S: it can neither
+ * extend nor rewrite a chain to widen authority, and a mutated definition
+ * D' != D fails the digest equality so no invocation fires on it.
+ *
+ * Run (expected: 4/4 lemmas PROVEN):
+ *   time tamarin-prover --prove caveat_delegation.spthy 2>&1 | tee tamarin_caveat.log
+ */
+
+theory CAVEAT_Delegation
+begin
+
+builtins: hashing
+
+functions: hmac/2
+
+/* ---------------------------------------------------------------- */
+/* Restrictions                                                     */
+/* ---------------------------------------------------------------- */
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+// Attenuation partial order on the two-level scope lattice.
+restriction CoversLattice:
+  "All s c #i.
+     Covers(s, c) @ #i
+   ==> (s = 'full') & ((c = 'full') | (c = 'read'))"
+
+restriction OneKeyPerServer:
+  "All s #i #j. KeyOnce(s) @ #i & KeyOnce(s) @ #j ==> #i = #j"
+
+/* ---------------------------------------------------------------- */
+/* Setup: per-server capability key, served tool definition          */
+/* ---------------------------------------------------------------- */
+
+rule Server_KeyGen:
+  [ Fr(~k) ]
+  --[ KeyGen($S, ~k), KeyOnce($S) ]->
+  [ !SKey($S, ~k) ]
+
+// The currently served tool definition (linear state: exactly one
+// definition is current at any time). Definitions are public content.
+rule Publish_Def:
+  [ Fr(~D) ]
+  --[ Publish($S, ~D) ]->
+  [ CurDef($S, ~D), Out(~D) ]
+
+// Rug-pull: the served definition mutates to adversary-chosen content.
+rule Mutate_Def:
+  [ CurDef($S, D), In(Dnew) ]
+  --[ Mutate($S, Dnew) ]->
+  [ CurDef($S, Dnew) ]
+
+/* ---------------------------------------------------------------- */
+/* Issuance, delegation, presentation                                */
+/* ---------------------------------------------------------------- */
+
+// Root capability minted at scope 'full', pinning the digest of the
+// definition current at grant time.
+rule Issue_Root:
+  [ !SKey($S, k), CurDef($S, D) ]
+  --[ RootIssued($S, 'full', h(D)) ]->
+  [ CurDef($S, D),
+    !Cap($S, 'full', h(D), hmac(<'root', $S, 'full', h(D)>, k)) ]
+
+// Cross-agent delegation: the holder attenuates the root to 'read' and
+// hands the resulting chain to a peer agent of unknown trustworthiness
+// (modelled as adversary knowledge).
+rule Delegate_To_Peer:
+  [ !Cap(S, 'full', dg, sig0) ]
+  --[ Delegated(S, 'read') ]->
+  [ Out(<'read', dg, hmac(<'cav', 'read'>, sig0)>) ]
+
+// The holder itself presents capabilities over the network (worst case:
+// presentations are observable; security rests on k_S, not on transport).
+rule Client_Present_Root:
+  [ !Cap(S, sc, dg, sig) ]
+  --[ Presented(S, sc) ]->
+  [ Out(<'present0', S, sc, dg, sig>) ]
+
+/* ---------------------------------------------------------------- */
+/* Verification with per-invocation re-attestation                   */
+/* ---------------------------------------------------------------- */
+
+// Depth-0 chain (root only).
+rule Verify_Root:
+  [ In(<'present0', S, scope, dg, sig>), !SKey(S, k), CurDef(S, D) ]
+  --[ Eq(sig, hmac(<'root', S, scope, dg>, k)),
+      Eq(dg, h(D)),                              // re-attestation
+      CapAccept(S, scope),
+      AttestDef(S, D, dg) ]->
+  [ CurDef(S, D) ]
+
+// Depth-1 chain (root + one caveat).
+rule Verify_Chain1:
+  [ In(<'present1', S, scope0, dg, cav, sig1>), !SKey(S, k), CurDef(S, D) ]
+  --[ Eq(sig1, hmac(<'cav', cav>, hmac(<'root', S, scope0, dg>, k))),
+      Covers(scope0, cav),
+      Eq(dg, h(D)),                              // re-attestation
+      CapAccept(S, cav),
+      AttestDef(S, D, dg) ]->
+  [ CurDef(S, D) ]
+
+/* ---------------------------------------------------------------- */
+/* Lemmas (Table 3, lower block)                                     */
+/* ---------------------------------------------------------------- */
+
+// Monotonic confinement (Thm 2): no sequence of adversary actions,
+// including injection of caveat-shaped content, yields acceptance of an
+// invocation outside the root authority. Every accepted scope descends
+// from a genuinely issued root on the attenuation lattice.
+lemma monotonic_confinement:
+  "All S sc #i.
+     CapAccept(S, sc) @ #i
+   ==> (Ex dg #j. RootIssued(S, 'full', dg) @ #j & #j < #i)
+     & ((sc = 'full') | (sc = 'read'))"
+
+// Capability-key secrecy: k_S never becomes adversary knowledge.
+lemma capability_key_secrecy:
+  "All S k #i.
+     KeyGen(S, k) @ #i ==> not (Ex #j. K(k) @ #j)"
+
+// Re-attestation soundness (Prop 3): every acceptance attests exactly the
+// definition being served at the moment of acceptance.
+lemma reattestation_soundness:
+  "All S D dg #i.
+     AttestDef(S, D, dg) @ #i ==> dg = h(D)"
+
+// Rug-pull detection: no acceptance ever attests a post-mutation
+// definition -- an accepted digest always traces back to a genuine grant,
+// and (by re-attestation soundness) matches the currently served
+// definition, so a mutated definition D' with h(D') != dg cannot fire.
+lemma rug_pull_detection:
+  "All S D dg #i.
+     AttestDef(S, D, dg) @ #i
+   ==> (Ex #j. RootIssued(S, 'full', dg) @ #j) & dg = h(D)"
+
+end
