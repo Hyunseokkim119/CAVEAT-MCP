@@ -1,0 +1,259 @@
+/*
+================================================================================
+  caveat_delegation.spthy   (finalised model, contribution C2)
+  ------------------------------------------------------------------------------
+  Symbolic model of CAVEAT capability-based authorisation & delegation.
+
+  Captures:
+    - HMAC-chained, attenuable capability tokens (paper Eq. (1)-(2)):
+          m0 = HMAC_kS( id | H(D) | vD )
+          mi = HMAC_{m_{i-1}}( cav_i )
+      Only caveat ADDITION is possible; removal/alteration breaks the chain.
+    - Runtime tool re-attestation: the CURRENT served definition is checked
+      against the PINNED manifest at every invocation, so a rug-pull mutation
+      D -> D' is detected before acting.
+    - Offline delegation to a peer agent by appending binding caveats.
+
+  Lemmas:
+    executable_delegation      (exists-trace sanity)
+    monotonic_confinement      (paper Theorem 1, symbolic form)
+    capability_key_secrecy     (root key never leaks -> anti-forgery basis)
+    reattestation_soundness    (paper Proposition 1: served digest = pinned)
+    rugpull_detected           (no acceptance ever uses a post-mutation def)
+
+  ------------------------------------------------------------------------------
+  HARDENING (relative to the initial skeleton):
+  (H5) The served definition is a LINEAR fact CurrentDef/3 that a rug pull
+       CONSUMES and REPLACES; invocation reads CurrentDef, recomputes h(Dcur)
+       and requires Eq(h(Dcur), hd) and Eq(vcur, vd) against the pin (H1'
+       above). In the skeleton the invoke rule ignored the served definition,
+       so a rug pull could not actually be blocked -- an artefact. The
+       reference implementation performs exactly this digest+version check.
+  (H6) Invocation emits UsedDef(S, Dcur); rug pull emits RugPullTo(S, D').
+       Lemma rugpull_detected then states that no acceptance ever uses a
+       mutated (non-pinned) definition.
+
+  RUN (author's workstation):
+     tamarin-prover caveat_delegation.spthy --prove
+================================================================================
+*/
+
+theory CAVEAT_Delegation
+begin
+
+builtins: hashing
+
+/*
+  Keyed-MAC abstraction:  mac(k, m) is unforgeable without k (no destructor),
+  so the Dolev-Yao adversary cannot produce mac(k,m) without the key/chain seed.
+  Verification is by RECONSTRUCTION in the rules (the verifier recomputes the
+  chain), so no inverse is needed.
+    m0 = mac(kS, <id, H(D), vD>)
+    mi = mac(m_{i-1}, cav_i)
+*/
+functions: mac/2
+
+// -----------------------------------------------------------------------------
+// Server setup: per-server key kS, approved definition D (digest h(D), version
+// vD). The approved digest is PINNED (persistent). The served definition lives
+// in a LINEAR CurrentDef fact so a rug pull can replace it (H5).
+// -----------------------------------------------------------------------------
+rule Server_Setup:
+    [ Fr(~kS), Fr(~D), Fr(~vD) ]
+  --[ ServerSetup($S, ~kS, ~D, ~vD)
+    , ManifestPinned($S, h(~D), ~vD) ]->
+    [ !ServerKey($S, ~kS)
+    , CurrentDef($S, ~D, ~vD)                 // linear: current served def
+    , !PinnedManifest($S, h(~D), ~vD) ]        // what the client pinned at approval
+
+
+// -----------------------------------------------------------------------------
+// Root capability issuance (Eq. 1):  m0 = mac(kS, <id, H(D), vD>)
+// Reads the current def to bind H(D); restores it (read-only w.r.t. mutation).
+// -----------------------------------------------------------------------------
+rule Issue_Root_Capability:
+    let m0 = mac(~kS, <~id, h(~D), ~vD>) in
+    [ !ServerKey($S, ~kS), CurrentDef($S, ~D, ~vD), Fr(~id) ]
+  --[ RootIssued($S, ~id, h(~D), ~vD) ]->
+    [ Cap($S, ~id, 'root', h(~D), ~vD, m0)
+    , CurrentDef($S, ~D, ~vD)                 // restore
+    , Out(<'cap', ~id>) ]
+
+
+// -----------------------------------------------------------------------------
+// Attenuation (Eq. 2): append caveat cav1, chaining the MAC:  m1 = mac(m0,cav1).
+// The caveat content may even be adversary-supplied (In(cav1)); it is still
+// genuinely chained by this server-side rule, and it only NARROWS authority.
+// -----------------------------------------------------------------------------
+rule Attenuate_Capability:
+    let m1 = mac(m0, cav1) in
+    [ Cap($S, ~id, prevCavs, hd, vd, m0), In(cav1) ]
+  --[ Attenuated($S, ~id, cav1) ]->
+    [ Cap($S, ~id, <prevCavs, cav1>, hd, vd, m1) ]
+
+
+// -----------------------------------------------------------------------------
+// Delegation to a peer C': append a binding caveat (agent + task). Offline.
+// -----------------------------------------------------------------------------
+rule Delegate_Capability:
+    let cavD = <'bind', $Cprime, ~task>
+        m2   = mac(m1, cavD) in
+    [ Cap($S, ~id, cavs, hd, vd, m1), Fr(~task) ]
+  --[ Delegated($S, ~id, $Cprime, ~task) ]->
+    [ Cap($S, ~id, <cavs, cavD>, hd, vd, m2)
+    , Out(<'deleg', ~id, $Cprime>) ]
+
+
+// -----------------------------------------------------------------------------
+// INJECTION CHANNEL: adversary may inject caveat-shaped content. Without the
+// chain seed / key, mac() is unforgeable, so injection cannot yield an
+// accepting capability outside authority.
+// -----------------------------------------------------------------------------
+rule Adv_Inject_Cav:
+    [ In(x) ]
+  --[ InjectedCav(x) ]->
+    [ Out(<'inject', x>) ]
+
+
+// -----------------------------------------------------------------------------
+// RUNTIME RE-ATTESTATION + INVOCATION.
+// The verifier recomputes the MAC chain from kS over <id,H(D),vD> and the
+// ORDERED caveats, checks the terminal tag, RE-ATTESTS the CURRENT served
+// definition against the pin (Eq(h(Dcur),hd), Eq(vcur,vd)), evaluates caveats,
+// and authorises. UsedDef records which definition was attested (H6).
+// -----------------------------------------------------------------------------
+
+// Depth-1: capability = root + one caveat cav1.
+rule Invoke_Accept_depth1:
+    let m0  = mac(~kS, <~id, hd, vd>)
+        m1  = mac(m0, cav1) in
+    [ !ServerKey($S, ~kS)
+    , !PinnedManifest($S, hd, vd)
+    , CurrentDef($S, Dcur, vcur)                  // read current served def (H5)
+    , Cap($S, ~id, <'root', cav1>, hd, vd, m1)
+    , In(ctx) ]
+  --[ CtxSatisfies(cav1, ctx)
+    , Eq(h(Dcur), hd)                             // re-attest digest
+    , Eq(vcur, vd)                                // re-attest version
+    , ReattestOK($S, hd, vd)
+    , UsedDef($S, Dcur)
+    , Authorise($S, ~id, ctx, cav1)
+    , Accepted($S, ~id, ctx) ]->
+    [ Invoked($S, ~id, ctx)
+    , CurrentDef($S, Dcur, vcur) ]                // restore
+
+// Depth-2: capability = root + cav1 + delegation caveat.
+rule Invoke_Accept_depth2:
+    let m0   = mac(~kS, <~id, hd, vd>)
+        m1   = mac(m0, cav1)
+        cavD = <'bind', $Cprime, task>
+        m2   = mac(m1, cavD) in
+    [ !ServerKey($S, ~kS)
+    , !PinnedManifest($S, hd, vd)
+    , CurrentDef($S, Dcur, vcur)
+    , Cap($S, ~id, <<'root', cav1>, cavD>, hd, vd, m2)
+    , In(ctx) ]
+  --[ CtxSatisfies(cav1, ctx)
+    , CtxSatisfies(cavD, ctx)
+    , Eq(h(Dcur), hd)
+    , Eq(vcur, vd)
+    , ReattestOK($S, hd, vd)
+    , UsedDef($S, Dcur)
+    , Authorise($S, ~id, ctx, cavD)
+    , BoundTo($Cprime, task)
+    , Accepted($S, ~id, ctx) ]->
+    [ Invoked($S, ~id, ctx)
+    , CurrentDef($S, Dcur, vcur) ]
+
+
+// -----------------------------------------------------------------------------
+// RUG-PULL: the server mutates its served definition AFTER approval (D -> D').
+// Consumes and REPLACES the linear CurrentDef; the PIN is unchanged (H5).
+// -----------------------------------------------------------------------------
+rule Rug_Pull_Mutate:
+    [ CurrentDef($S, D, vd), Fr(~Dprime) ]
+  --[ Mutated($S, D, ~Dprime), RugPull($S), RugPullTo($S, ~Dprime) ]->
+    [ CurrentDef($S, ~Dprime, vd) ]
+
+
+// -----------------------------------------------------------------------------
+// Restrictions.
+//   Equality discharges the re-attestation and version checks.
+//   caveat_semantics: a caveat counts as satisfied only if the environment
+//   provided a matching Grant for that (caveat, ctx) -- an abstraction of a
+//   concrete caveat predicate (path prefix, argument bound, binding, ...).
+// -----------------------------------------------------------------------------
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+restriction caveat_semantics:
+    "All cav ctx #i. CtxSatisfies(cav, ctx) @ #i
+        ==> Ex #j. Grant(cav, ctx) @ #j & #j < #i"
+
+rule Env_Grant:
+    [ In(<cav, ctx>) ]
+  --[ Grant(cav, ctx) ]->
+    [ ]
+
+
+// =============================================================================
+// LEMMAS
+// =============================================================================
+
+/* Sanity: a full root -> attenuate -> delegate -> invoke path is reachable. */
+lemma executable_delegation:
+  exists-trace
+  "Ex S id ctx Cprime task #a #b.
+        Accepted(S, id, ctx) @ #a
+      & BoundTo(Cprime, task) @ #b"
+
+/*
+  Monotonic confinement (Theorem 1, symbolic form): any authorised caveat was
+  genuinely chained by the honest server (Attenuated / Delegated). The adversary
+  cannot obtain acceptance for a caveat it merely injected without the server
+  chaining it. Authority only narrows, never widens.
+*/
+lemma monotonic_confinement:
+  all-traces
+  "All S id ctx cav #i.
+        Authorise(S, id, ctx, cav) @ #i
+    ==> ( (Ex #j. Attenuated(S, id, cav) @ #j & #j < #i)
+        | (Ex Cprime task #j. Delegated(S, id, Cprime, task) @ #j
+                              & cav = <'bind', Cprime, task> & #j < #i) )"
+
+/*
+  Root capability key secrecy: while a server is set up, its root key kS never
+  leaks (no reveal rule). This underpins confinement against injection.
+*/
+lemma capability_key_secrecy:
+  all-traces
+  "All S kS D vd #i.
+        ServerSetup(S, kS, D, vd) @ #i
+    ==> not (Ex #k. K(kS) @ #k)"
+
+/*
+  Re-attestation soundness (Proposition 1): every acceptance re-attests a
+  current definition whose digest+version equal the pinned manifest.
+*/
+lemma reattestation_soundness:
+  all-traces
+  "All S id ctx #a.
+        Accepted(S, id, ctx) @ #a
+    ==> Ex hd vd Dcur #m #p.
+            ReattestOK(S, hd, vd) @ #m
+          & UsedDef(S, Dcur) @ #a
+          & ManifestPinned(S, hd, vd) @ #p
+          & #p < #a"
+
+/*
+  Rug-pull detection: no acceptance ever uses a post-mutation definition. A
+  mutated definition D' has h(D') != pinned digest, so the re-attestation
+  equality cannot hold and the invocation cannot fire on it.
+*/
+lemma rugpull_detected:
+  all-traces
+  "not ( Ex S Dp #m #a.
+             RugPullTo(S, Dp) @ #m
+           & UsedDef(S, Dp) @ #a )"
+
+end

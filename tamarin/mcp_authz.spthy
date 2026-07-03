@@ -1,0 +1,295 @@
+/*
+================================================================================
+  mcp_authz.spthy   (finalised model, contribution C1)
+  ------------------------------------------------------------------------------
+  Injection-aware symbolic model of the Model Context Protocol (MCP)
+  authorisation flow:
+        OAuth 2.1 authorisation-code grant with PKCE (S256),
+        RFC 8707 Resource Indicators (audience binding),
+        RFC 9728 Protected Resource Metadata discovery (abstracted),
+        Dolev-Yao adversary EXTENDED with an injection channel
+        (indirect prompt injection / tool-description poisoning).
+
+  Lemmas:
+    P1 token_secrecy            (paper Property 1)
+    P2 injective_agreement      (paper Property 2)
+    P3 audience_binding         (paper Property 3)
+    P4 confused_deputy_resist   (paper Property 4)
+    + executable_honest         (exists-trace sanity, guards against vacuity)
+
+  ------------------------------------------------------------------------------
+  MODELLING HARDENING (relative to the initial skeleton), documented so the
+  verdicts are faithful rather than vacuous:
+
+  (H1) TOKEN DELIVERY IS CONFIDENTIAL.  Steps 6 (AS->C) and 7 (C->S) run over
+       server-authenticated confidential channels (TLS), modelled with the
+       LINEAR facts SecChanASC/2 and CallChan/2, NOT public Out().  Without
+       this, the token would be on the public wire and P1 would falsify
+       trivially -- an artefact, not a real flaw of OAuth-over-TLS.
+
+  (H2) A MALICIOUS SERVER STILL LEARNS WHAT IS SENT TO IT.  rule Leak_Call
+       lets a compromised server publish the token a client presented to it;
+       and rule Adv_Call lets the adversary open a connection to ANY server
+       and send it a token it knows.  This is exactly the confused-deputy
+       setting: honest C presents its (aud=S_A) token to malicious S_A, the
+       adversary learns it, and tries to redeem it at honest S_B.
+
+  (H3) LEMMAS RANGE OVER THE COMMON ACTION Accept(.).  Both the secure and the
+       -aud acceptance rules emit Accept(S,t)+ServerOf(S,uri); only the secure
+       rule additionally enforces Eq(audOf(t),uri).  Stating audience_binding
+       and confused_deputy over Accept(.) makes the -aud variant genuinely
+       FALSIFIABLE (a real attack trace) rather than vacuously proven.
+
+  (H4) AGREEMENT IS CLAIMED AT RUN COMPLETION.  The client emits ClientDone(.)
+       only when it has actually obtained the AS-minted token over the
+       confidential channel; the AS emits AS_Granted(.) only when it mints a
+       token, which unifies (cid,res,cc,code).  This matches Property 2's
+       "completes a run" and yields injective agreement.
+
+  RUN (author's workstation):
+     tamarin-prover mcp_authz.spthy --prove
+  For the confused-deputy NEGATIVE result switch to the -aud variant:
+     comment out Server_Accept_full, uncomment Server_Accept_noaud, re-run
+     confused_deputy_resistance to extract the attack trace.
+================================================================================
+*/
+
+theory MCP_Authz
+begin
+
+builtins: hashing, signing
+
+/*
+  audOf/1 extracts the audience (resource id) from a token payload.
+  Token shape:  sign(<'tok', cid, res, ntok>, skAS)
+*/
+functions: audOf/1
+equations:  audOf(sign(<'tok', cid, res, ntok>, skAS)) = res
+
+
+// =============================================================================
+// Authorisation-Server long-term key (unique AS)
+// =============================================================================
+rule Register_AS_key:
+    [ Fr(~skAS) ]
+  --[ OnlyOnceAS() ]->
+    [ !Ltk_AS(~skAS), !Pk_AS(pk(~skAS)), Out(pk(~skAS)) ]
+
+restriction only_one_AS:
+    "All #i #j. OnlyOnceAS() @ #i & OnlyOnceAS() @ #j ==> #i = #j"
+
+
+// =============================================================================
+// Server creation: fresh canonical URI (= resource id) per server.
+// =============================================================================
+rule Create_Server:
+    [ Fr(~uri) ]
+  --[ ServerCreated($S, ~uri) ]->
+    [ !ServerURI($S, ~uri) ]
+
+// Adversary may compromise a server, learning (and publishing) its URI and
+// receiving a persistent malicious marker used by the leak channel (H2).
+rule Compromise_Server:
+    [ !ServerURI($S, ~uri) ]
+  --[ MaliciousServer($S), Compromise($S, ~uri) ]->
+    [ !Malicious($S), Out(~uri) ]
+
+
+// =============================================================================
+// Client / resource-owner setup: fresh client id.
+// =============================================================================
+rule RO_Client_Setup:
+    [ Fr(~cid) ]
+  --[ ClientCreated($C, ~cid) ]->
+    [ !ClientId($C, ~cid), ClientReady($C, ~cid) ]
+
+
+// =============================================================================
+// INJECTION CHANNEL (agentic extension to Dolev-Yao).
+// Adversary turns anything it knows into injectable content that may steer the
+// agent's *target selection*. It cannot fabricate cryptographic material.
+// =============================================================================
+rule Adv_Inject:
+    [ In(x) ]
+  --[ Injected(x) ]->
+    [ Out(<'inject', x>) ]
+
+
+// =============================================================================
+// STEP 1-2 (RFC 9728 discovery, abstracted): client selects a target server.
+// Honest selection, or injection-steered selection; either way res = server URI.
+// =============================================================================
+rule Client_SelectTarget_honest:
+    [ ClientReady($C, ~cid), !ServerURI($S, ~uri) ]
+  --[ Selected($C, $S, ~uri) ]->
+    [ ClientTargeting($C, ~cid, $S, ~uri) ]
+
+rule Client_SelectTarget_injected:
+    [ ClientReady($C, ~cid), !ServerURI($S, ~uri), In(<'inject', ~uri>) ]
+  --[ Selected($C, $S, ~uri), SelectedViaInjection($C, $S) ]->
+    [ ClientTargeting($C, ~cid, $S, ~uri) ]
+
+
+// =============================================================================
+// STEP 3-4: PKCE authz request (cc = h(cv)) + resource indicator res.
+// =============================================================================
+rule Client_AuthzRequest:
+    let cc = h(~cv) in
+    [ ClientTargeting($C, ~cid, $S, ~uri), Fr(~cv) ]
+  --[ ClientAuthzReq($C, ~cid, ~uri, cc) ]->
+    [ Client_WaitCode($C, ~cid, $S, ~uri, ~cv, cc)
+    , Out(<'authzReq', ~cid, cc, ~uri>) ]
+
+rule AS_IssueCode:
+    [ In(<'authzReq', cid, cc, res>), Fr(~code) ]
+  --[ AS_BindCode(cid, res, cc, ~code) ]->
+    [ AS_CodeIssued(cid, res, cc, ~code)
+    , Out(<'authzCode', ~code>) ]
+
+
+// =============================================================================
+// STEP 5-6: token request redeems code + PKCE verifier + res; AS mints
+// audience-bound token (aud = res) after checking h(cv) == cc, and DELIVERS it
+// over the confidential AS->C channel (H1). AS_Granted marks run completion at
+// the AS side (H4).
+// =============================================================================
+rule Client_TokenRequest:
+    [ Client_WaitCode($C, ~cid, $S, ~uri, ~cv, cc)
+    , In(<'authzCode', code>) ]
+  --[ ClientRedeem($C, ~cid, ~uri, code) ]->
+    [ Client_WaitToken($C, ~cid, $S, ~uri, ~cv, code)
+    , Out(<'tokenReq', ~cid, code, ~cv, ~uri>) ]
+
+rule AS_IssueToken:
+    let cc = h(cv) in
+    [ In(<'tokenReq', cid, code, cv, res>)
+    , AS_CodeIssued(cid, res, cc, code)     // binds only if h(cv)==cc AND same res
+    , !Ltk_AS(skAS)
+    , Fr(~ntok) ]
+  --[ Issue(cid, res, ~ntok)
+    , AS_Granted(cid, res, code)
+    , IssuedToken(cid, res, sign(<'tok', cid, res, ~ntok>, skAS)) ]->
+    [ SecChanASC(cid, sign(<'tok', cid, res, ~ntok>, skAS)) ]   // H1: confidential
+
+
+// =============================================================================
+// STEP 7: client receives its token over the confidential channel and presents
+// it to the targeted server over a server-addressed confidential channel (H1).
+// ClientDone marks run completion at the client side (H4).
+// =============================================================================
+rule Client_PresentToken:
+    [ Client_WaitToken($C, ~cid, $S, ~uri, ~cv, code)
+    , SecChanASC(~cid, t) ]
+  --[ PresentedTo($C, t, $S)
+    , ClientDone($C, ~cid, ~uri, code) ]->
+    [ CallChan($S, t), ClientPresented($C, $S, t) ]
+
+// H2: adversary can open a connection to any server and send it a token it
+// knows; a compromised server publishes the token it received.
+rule Adv_Call:
+    [ In(t), !ServerURI($S, ~uri) ]
+  --[ AdvCall($S, t) ]->
+    [ CallChan($S, t) ]
+
+rule Leak_Call:
+    [ CallChan($S, t), !Malicious($S) ]
+  --[ LeakedCall($S, t) ]->
+    [ Out(t) ]
+
+
+// =============================================================================
+// STEP 8: server acceptance.
+//   Server_Accept_full  : SECURE -- checks audience == own URI (RFC 8707).
+//   Server_Accept_noaud : INSECURE "-aud" variant (audience check omitted).
+// BOTH emit the common Accept(.)+ServerOf(.) actions (H3); keep exactly ONE
+// active. Default: the secure full model.
+// =============================================================================
+rule Server_Accept_full:
+    let claimedAud = audOf(t) in
+    [ CallChan($S, t), !ServerURI($S, ~uri), !Pk_AS(pkAS) ]
+  --[ Accept($S, t)
+    , ServerOf($S, ~uri)
+    , Eq(claimedAud, ~uri)                  // RFC 8707 audience binding
+    , AcceptedFull($S, t) ]->
+    [ ServiceGranted($S, t) ]
+
+/*  ---- INSECURE VARIANT: uncomment for the confused-deputy counterexample,
+        and comment out Server_Accept_full above. ----
+rule Server_Accept_noaud:
+    [ CallChan($S, t), !ServerURI($S, ~uri), !Pk_AS(pkAS) ]
+  --[ Accept($S, t), ServerOf($S, ~uri), AcceptedNoAud($S, t) ]->
+    [ ServiceGranted($S, t) ]
+*/
+
+
+// =============================================================================
+// Restrictions
+// =============================================================================
+restriction Equality:
+    "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+
+// =============================================================================
+// LEMMAS
+// =============================================================================
+
+/* Sanity: an honest run reaches acceptance by an uncompromised server
+   (guards against a vacuous 'proven'). */
+lemma executable_honest:
+  exists-trace
+  "Ex S t #a.
+        Accept(S, t) @ #a
+      & not (Ex #m. MaliciousServer(S) @ #m)"
+
+/*
+  P1 Token secrecy.
+  A token issued with audience res is secret, provided the server owning res is
+  not adversary-controlled.
+*/
+lemma token_secrecy:
+  all-traces
+  "All cid res tok #i.
+        IssuedToken(cid, res, tok) @ #i
+      & ( All S #s. ServerOf(S, res) @ #s
+                    ==> not (Ex #m. MaliciousServer(S) @ #m) )
+    ==> not (Ex #j. K(tok) @ #j)"
+
+/*
+  P2 Injective agreement between client run completion and AS token grant.
+  (Claimed at completion, H4.)
+*/
+lemma injective_agreement:
+  all-traces
+  "( All C cid res code #i.
+        ClientDone(C, cid, res, code) @ #i
+    ==> Ex #j. AS_Granted(cid, res, code) @ #j & #j < #i )
+ & ( All C1 cid1 res1 C2 cid2 res2 code #i1 #i2.
+        ClientDone(C1, cid1, res1, code) @ #i1
+      & ClientDone(C2, cid2, res2, code) @ #i2
+    ==> #i1 = #i2 )"
+
+/*
+  P3 Audience binding: any token accepted by the secure model has audience =
+  the accepting server's own URI. (Over the common Accept action, H3.)
+*/
+lemma audience_binding:
+  all-traces
+  "All S t uri #i.
+        Accept(S, t) @ #i & ServerOf(S, uri) @ #i
+    ==> audOf(t) = uri"
+
+/*
+  P4 Confused-deputy resistance: an honest server never accepts a token that a
+  client presented to a DISTINCT malicious server. (Over Accept, H3.)
+*/
+lemma confused_deputy_resistance:
+  all-traces
+  "All Sb t uriB #i.
+        Accept(Sb, t) @ #i & ServerOf(Sb, uriB) @ #i
+      & not (Ex #m. MaliciousServer(Sb) @ #m)
+    ==> not ( Ex C Sa #p.
+                 PresentedTo(C, t, Sa) @ #p
+               & (Ex #q. MaliciousServer(Sa) @ #q)
+               & not (Sa = Sb) )"
+
+end

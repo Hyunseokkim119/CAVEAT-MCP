@@ -1,0 +1,18 @@
+{
+  "full": {
+    "T3_rugpull_blocked": true,
+    "T6_overreach_blocked": true
+  },
+  "no_confinement": {
+    "T3_rugpull_blocked": true,
+    "T6_overreach_blocked": false
+  },
+  "no_manifest_bind": {
+    "T3_rugpull_blocked": false,
+    "T6_overreach_blocked": true
+  },
+  "no_reattestation": {
+    "T3_rugpull_blocked": false,
+    "T6_overreach_blocked": true
+  }
+}
